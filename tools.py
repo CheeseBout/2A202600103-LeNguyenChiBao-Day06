@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -144,6 +146,15 @@ def _normalize_day(day: str) -> str:
     return text
 
 
+def _normalize_text(value: str) -> str:
+    text = (value or "").strip().lower()
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 @tool
 def get_nearest_branch(location: str = "VinUni, Gia Lam, Ha Noi", max_results: int = 3) -> str:
     """Return nearest branch names with distances from an input location."""
@@ -188,12 +199,17 @@ def get_nearest_branch(location: str = "VinUni, Gia Lam, Ha Noi", max_results: i
 def get_suitable_availibility_doctor(day: str, shift: str, specialty: str = "", facility: str = "") -> str:
     """Return suitable available doctors for a given day, shift, and optional specialty/facility."""
     normalized_day = _normalize_day(day)
+    shift_filter = (shift or "").strip().lower()
     specialty_filter = (specialty or "").strip().lower()
+    specialty_filter_norm = _normalize_text(specialty or "")
     facility_filter = (facility or "").strip().lower()
+    facility_filter_norm = _normalize_text(facility or "")
     query = """
     SELECT
     d.doctor_id,
     d.full_name AS doctor_name,
+    d.degrees,
+    d.qualification,
     f.facility_id,
     f.name AS facility_name,
     sch.shift,
@@ -213,7 +229,10 @@ def get_suitable_availibility_doctor(day: str, shift: str, specialty: str = "", 
     LEFT JOIN specialties sp
         ON sp.specialty_id = ds.specialty_id
     WHERE v.slot_date = ?
-    AND sch.shift = ?
+    AND (
+        (? = 'full_day' AND sch.shift IN ('morning', 'afternoon'))
+        OR (? != 'full_day' AND sch.shift = ?)
+    )
     AND d.is_active = 1
     AND sch.status = 'active'
     AND (
@@ -226,7 +245,7 @@ def get_suitable_availibility_doctor(day: str, shift: str, specialty: str = "", 
         OR LOWER(f.name) LIKE '%' || ? || '%'
         OR LOWER(COALESCE(f.normalized_name, '')) LIKE '%' || ? || '%'
     )
-    GROUP BY d.doctor_id, d.full_name, f.facility_id, f.name, sch.shift
+    GROUP BY d.doctor_id, d.full_name, d.degrees, d.qualification, f.facility_id, f.name, sch.shift
     ORDER BY available_slot_count DESC, first_available_time ASC;
     """
     try:
@@ -268,13 +287,15 @@ def get_suitable_availibility_doctor(day: str, shift: str, specialty: str = "", 
                 query,
                 (
                     normalized_day,
-                    shift,
+                    shift_filter,
+                    shift_filter,
+                    shift_filter,
                     specialty_filter,
                     specialty_filter,
-                    specialty_filter,
+                    specialty_filter_norm,
                     facility_filter,
                     facility_filter,
-                    facility_filter,
+                    facility_filter_norm,
                 ),
             )
             rows = cursor.fetchall()
@@ -285,9 +306,19 @@ def get_suitable_availibility_doctor(day: str, shift: str, specialty: str = "", 
             if facility_filter:
                 extra_parts.append(f"co so '{facility}'")
             extra = ", " + ", ".join(extra_parts) if extra_parts else ""
-            return f"Khong tim thay bac si nao co lich trong ngay {normalized_day}, ca {shift}{extra}."
+            with sqlite3.connect(DB_PATH) as connection:
+                cursor = connection.cursor()
+                min_day, max_day = cursor.execute(
+                    "SELECT MIN(slot_date), MAX(slot_date) FROM doctor_schedule_slots WHERE status = 'available'"
+                ).fetchone()
+            if min_day and max_day:
+                return (
+                    f"Khong tim thay bac si nao co lich trong ngay {normalized_day}, ca {shift_filter}{extra}. "
+                    f"Du lieu lich hien co tu {min_day} den {max_day}."
+                )
+            return f"Khong tim thay bac si nao co lich trong ngay {normalized_day}, ca {shift_filter}{extra}."
         return "\n".join(
-            f"{row[1]} | {row[3]} | {row[4]} | slots: {row[5]} | {row[6]}-{row[7]} | {row[8] or 'N/A'}"
+            f"{row[1]} | degree: {row[2] or 'N/A'} | qualification: {row[3] or 'N/A'} | {row[5]} | {row[6]} | slots: {row[7]} | {row[8]}-{row[9]} | {row[10] or 'N/A'}"
             for row in rows
         )
     except sqlite3.Error as exc:
@@ -323,11 +354,15 @@ def get_all_specialties(facility: str) -> str:
             JOIN doctors d ON d.doctor_id = ds.doctor_id
             JOIN doctor_schedules sch ON sch.doctor_id = d.doctor_id
             JOIN facilities f ON f.facility_id = sch.facility_id
-            WHERE f.name LIKE '%' || ? || '%'
+            WHERE (
+                LOWER(COALESCE(f.name, '')) LIKE '%' || ? || '%'
+                OR LOWER(COALESCE(f.normalized_name, '')) LIKE '%' || ? || '%'
+            )
             AND d.is_active = 1
             AND sch.status = 'active';
             """
-            cursor.execute(query, (facility.strip().lower(),))
+            facility_filter = facility.strip().lower()
+            cursor.execute(query, (facility_filter, facility_filter))
             rows = cursor.fetchall()
         if not rows:
             return f"Khong tim thay chuyen khoa nao trong co so '{facility}'."
