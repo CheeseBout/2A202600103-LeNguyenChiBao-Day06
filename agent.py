@@ -5,6 +5,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
+from tools import get_nearest_branch
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,6 +19,7 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
 # 3. Khởi tạo LLM và Tools
+tools_list = [get_nearest_branch, ]
 llm = ChatOpenAI(model="gpt-4o-mini")
 llm_with_tools = llm.bind_tools(tools_list)
 
